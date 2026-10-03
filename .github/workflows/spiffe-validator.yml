@@ -1,0 +1,51 @@
+name: SPIFFE validator
+
+permissions:
+  contents: read
+
+on:
+  pull_request:
+    paths:
+    - .github/workflows/spiffe-validator.yml
+    - .bazelversion
+    - source/extensions/transport_sockets/tls/cert_validator/spiffe/**
+    - test/extensions/transport_sockets/tls/cert_validator/spiffe/**
+    - docs/root/api-v3/config/certificate_validators/**
+    - changelogs/current/behavior_changes/tls__strict_spiffe_svids.rst
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  native-test:
+    if: github.repository == 'DRJ-Technologies/envoy'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+    - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+      with:
+        persist-credentials: false
+    - name: Load native Bazel version
+      shell: bash
+      run: |
+        set -euo pipefail
+        version=$(cat .bazelversion)
+        name="bazel-${version}-linux-x86_64"
+        cd "$RUNNER_TEMP"
+        curl --fail --location --retry 2 --output "$name" \
+          "https://github.com/bazelbuild/bazel/releases/download/${version}/${name}"
+        curl --fail --location --retry 2 --output "${name}.sha256" \
+          "https://github.com/bazelbuild/bazel/releases/download/${version}/${name}.sha256"
+        sha256sum --check "${name}.sha256"
+        chmod +x "$name"
+        ln -s "$RUNNER_TEMP/$name" "$RUNNER_TEMP/bazel"
+        echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+    - name: Native SPIFFE validator regression tests
+      shell: bash
+      run: |
+        bazel --batch --output_user_root="$RUNNER_TEMP/bazel-root" \
+          --host_jvm_args=-Xmx2g test --config=gcc --jobs=4 \
+          --local_resources=cpu=4 --local_resources=memory=6144 \
+          --compilation_mode=fastbuild --copt=-g0 --test_output=errors \
+          //test/extensions/transport_sockets/tls/cert_validator/spiffe:spiffe_validator_test

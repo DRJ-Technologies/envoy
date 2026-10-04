@@ -1,5 +1,6 @@
 #include <cstdint>
 #include <fstream>
+#include <limits>
 #include <memory>
 #include <regex>
 #include <string>
@@ -31,6 +32,7 @@
 #include "absl/status/status.h"
 #include "gtest/gtest.h"
 #include "include/nlohmann/json.hpp"
+#include "openssl/pem.h"
 #include "openssl/ssl.h"
 #include "openssl/x509v3.h"
 
@@ -49,6 +51,35 @@ using GeneralNamesPtr = CSmartPtr<GENERAL_NAMES, GENERAL_NAMES_free>;
 using X509StoreContextPtr = CSmartPtr<X509_STORE_CTX, X509_STORE_CTX_free>;
 using X509Ptr = CSmartPtr<X509, X509_free>;
 using SSLContextPtr = CSmartPtr<SSL_CTX, SSL_CTX_free>;
+
+void replaceUriSans(X509* cert, const std::vector<std::string>& uris, bool with_dns = false) {
+  GeneralNamesPtr names = sk_GENERAL_NAME_new_null();
+  for (const auto& uri : uris) {
+    GENERAL_NAME* name = GENERAL_NAME_new();
+    ASN1IA5StringPtr value = ASN1_IA5STRING_new();
+    ASSERT_EQ(1, ASN1_STRING_set(value.get(), uri.data(), uri.size()));
+    GENERAL_NAME_set0_value(name, GEN_URI, value.release());
+    ASSERT_NE(0, sk_GENERAL_NAME_push(names.get(), name));
+  }
+  if (with_dns) {
+    GENERAL_NAME* name = GENERAL_NAME_new();
+    ASN1IA5StringPtr value = ASN1_IA5STRING_new();
+    ASSERT_EQ(1, ASN1_STRING_set(value.get(), "example.com", 11));
+    GENERAL_NAME_set0_value(name, GEN_DNS, value.release());
+    ASSERT_NE(0, sk_GENERAL_NAME_push(names.get(), name));
+  }
+  ASSERT_EQ(1, X509_add1_ext_i2d(cert, NID_subject_alt_name, names.get(), 0, X509V3_ADD_REPLACE));
+}
+
+void signWithTestCa(X509* cert) {
+  bssl::UniquePtr<BIO> bio(BIO_new_file(
+      TestEnvironment::substitute("{{ test_rundir }}/test/common/tls/test_data/ca_key.pem").c_str(),
+      "r"));
+  ASSERT_NE(nullptr, bio);
+  bssl::UniquePtr<EVP_PKEY> key(PEM_read_bio_PrivateKey(bio.get(), nullptr, nullptr, nullptr));
+  ASSERT_NE(nullptr, key);
+  ASSERT_GT(X509_sign(cert, key.get(), EVP_sha256()), 0);
+}
 
 class TestSPIFFEValidator : public testing::Test {
 public:
@@ -257,11 +288,33 @@ TEST(SPIFFEValidator, TestExtractTrustDomain) {
   EXPECT_EQ("", SPIFFEValidator::extractTrustDomain("abc.com/"));
   EXPECT_EQ("", SPIFFEValidator::extractTrustDomain("abc.com/workload/"));
   EXPECT_EQ("", SPIFFEValidator::extractTrustDomain("spiffe://"));
-  EXPECT_EQ("abc.com", SPIFFEValidator::extractTrustDomain("spiffe://abc.com/"));
+  EXPECT_EQ("", SPIFFEValidator::extractTrustDomain("spiffe://abc.com/"));
   EXPECT_EQ("dev.envoy.com",
             SPIFFEValidator::extractTrustDomain("spiffe://dev.envoy.com/workload1"));
   EXPECT_EQ("k8s-west.example.com", SPIFFEValidator::extractTrustDomain(
                                         "spiffe://k8s-west.example.com/ns/staging/sa/default"));
+}
+
+TEST(SPIFFEValidator, TestRejectMalformedSpiffeIds) {
+  for (const auto* uri :
+       {"spiffe://example.com", "spiffe://example.com/", "spiffe:///workload",
+        "spiffe://Example.com/workload", "spiffe://user@example.com/workload",
+        "spiffe://example.com:443/workload", "spiffe://example.com/workload?query",
+        "spiffe://example.com/workload#fragment", "spiffe://example.com/a%2fb",
+        "spiffe://example.com/a//b", "spiffe://example.com/a/./b", "spiffe://example.com/a/../b",
+        "spiffe://example.com/a/", "https://example.com/workload"}) {
+    EXPECT_EQ("", SPIFFEValidator::extractTrustDomain(uri)) << uri;
+  }
+  std::string with_nul = "spiffe://example.com/workload";
+  with_nul.append("\0other", 6);
+  EXPECT_EQ("", SPIFFEValidator::extractTrustDomain(with_nul));
+  EXPECT_EQ("some_domain.example", SPIFFEValidator::extractTrustDomain(
+                                       "spiffe://some_domain.example/ns/Upper-case_1/sa/a.b"));
+  const std::string domain(255, 'a');
+  EXPECT_EQ(domain, SPIFFEValidator::extractTrustDomain("spiffe://" + domain + "/workload"));
+  EXPECT_EQ("", SPIFFEValidator::extractTrustDomain("spiffe://" + domain + "a/workload"));
+  EXPECT_EQ("example.com", SPIFFEValidator::extractTrustDomain("spiffe://example.com/" +
+                                                               std::string(2048 - 21, 'a')));
 }
 
 TEST(SPIFFEValidator, TestCertificatePrecheck) {
@@ -283,10 +336,167 @@ TEST(SPIFFEValidator, TestCertificatePrecheck) {
   EXPECT_FALSE(SPIFFEValidator::certificatePrecheck(cert.get()));
 
   cert = readCertFromFile(TestEnvironment::substitute(
-      // basicConstraints CA:False, keyUsage does not have keyCertSign and cRLSign
-      // should be considered valid (i.e. return 1).
+      // A leaf without a URI SAN is not an X509-SVID.
       "{{ test_rundir }}/test/common/tls/test_data/extensions_cert.pem"));
+  EXPECT_FALSE(SPIFFEValidator::certificatePrecheck(cert.get()));
+  cert = readCertFromFile(TestEnvironment::substitute(
+      "{{ test_rundir }}/test/common/tls/test_data/spiffe_san_cert.pem"));
   EXPECT_TRUE(SPIFFEValidator::certificatePrecheck(cert.get()));
+}
+
+TEST(SPIFFEValidator, TestRequireExactlyOneUriSan) {
+  for (const std::vector<std::string>& uris :
+       {std::vector<std::string>{},
+        {"spiffe://example.com/workload", "spiffe://other.com/workload"},
+        {"spiffe://example.com/workload", "spiffe://example.com/workload"},
+        {"spiffe://example.com/workload", "https://other.com/workload"},
+        {"https://other.com/workload", "spiffe://example.com/workload"}}) {
+    auto cert = readCertFromFile(TestEnvironment::substitute(
+        "{{ test_rundir }}/test/common/tls/test_data/spiffe_san_cert.pem"));
+    replaceUriSans(cert.get(), uris, true);
+    EXPECT_FALSE(SPIFFEValidator::certificatePrecheck(cert.get()));
+  }
+  auto cert = readCertFromFile(TestEnvironment::substitute(
+      "{{ test_rundir }}/test/common/tls/test_data/spiffe_san_cert.pem"));
+  replaceUriSans(cert.get(), {"spiffe://example.com/workload"}, true);
+  EXPECT_TRUE(SPIFFEValidator::certificatePrecheck(cert.get()));
+}
+
+TEST_F(TestSPIFFEValidator, TestMultipleUrisCannotSelectOneRootAndMatchAnotherDomain) {
+  envoy::type::matcher::v3::StringMatcher expected;
+  expected.set_exact("spiffe://lyft.com/workload");
+  setSanMatchers({expected});
+  ASSERT_OK(initialize(TestEnvironment::substitute(R"EOF(
+name: envoy.tls.cert_validator.spiffe
+typed_config:
+  "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.SPIFFECertValidatorConfig
+  trust_domains:
+    - name: example.com
+      trust_bundle:
+        filename: "{{ test_rundir }}/test/common/tls/test_data/ca_cert.pem"
+    - name: lyft.com
+      trust_bundle:
+        filename: "{{ test_rundir }}/test/common/tls/test_data/fake_ca_cert.pem"
+)EOF")));
+  for (bool is_server : {false, true}) {
+    auto cert = readCertFromFile(TestEnvironment::substitute(
+        "{{ test_rundir }}/test/common/tls/test_data/spiffe_san_cert.pem"));
+    replaceUriSans(cert.get(), {"spiffe://example.com/workload", "spiffe://lyft.com/workload"});
+    signWithTestCa(cert.get());
+    EXPECT_EQ(nullptr, validator().getTrustBundleStore(cert.get(), ""));
+    EXPECT_FALSE(validator().matchSubjectAltName(*cert.get()));
+    SSLContextPtr ssl_ctx = SSL_CTX_new(TLS_method());
+    bssl::UniquePtr<STACK_OF(X509)> chain(sk_X509_new_null());
+    sk_X509_push(chain.get(), cert.release());
+    EXPECT_EQ(ValidationResults::ValidationStatus::Failed,
+              validator()
+                  .doVerifyCertChain(*chain, nullptr, nullptr, *ssl_ctx, {}, is_server, "")
+                  .status);
+  }
+}
+
+TEST_F(TestSPIFFEValidator, TestSignedSingleUriAndOtherSanTypesRemainValid) {
+  ASSERT_OK(initialize(TestEnvironment::substitute(R"EOF(
+name: envoy.tls.cert_validator.spiffe
+typed_config:
+  "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.SPIFFECertValidatorConfig
+  trust_domains:
+    - name: example.com
+      trust_bundle:
+        filename: "{{ test_rundir }}/test/common/tls/test_data/ca_cert.pem"
+)EOF")));
+  for (bool is_server : {false, true}) {
+    auto cert = readCertFromFile(TestEnvironment::substitute(
+        "{{ test_rundir }}/test/common/tls/test_data/spiffe_san_cert.pem"));
+    replaceUriSans(cert.get(), {"spiffe://example.com/ns/staging/sa/default"}, true);
+    signWithTestCa(cert.get());
+    SSLContextPtr ssl_ctx = SSL_CTX_new(TLS_method());
+    bssl::UniquePtr<STACK_OF(X509)> chain(sk_X509_new_null());
+    sk_X509_push(chain.get(), cert.release());
+    EXPECT_EQ(ValidationResults::ValidationStatus::Successful,
+              validator()
+                  .doVerifyCertChain(*chain, nullptr, nullptr, *ssl_ctx, {}, is_server, "")
+                  .status);
+  }
+}
+
+TEST_F(TestSPIFFEValidator, TestExplicitEmptyInlineBundleDeniesWithoutDefaultRoots) {
+  for (const auto* field : {"inline_string", "inline_bytes"}) {
+    ASSERT_OK(initialize(absl::StrCat(R"EOF(
+name: envoy.tls.cert_validator.spiffe
+typed_config:
+  "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.SPIFFECertValidatorConfig
+  trust_domains:
+    - name: example.com
+      trust_bundle:
+        )EOF",
+                                      field, ": \"\"\n")));
+    EXPECT_NE(nullptr, validator().getSpiffeData()->trust_bundle_stores_["example.com"][""].get());
+    EXPECT_TRUE(validator().getSpiffeData()->ca_certs_.empty());
+    EXPECT_EQ(nullptr, validator().getCaCertInformation());
+    EXPECT_EQ(std::make_optional(std::numeric_limits<uint32_t>::max()),
+              validator().daysUntilFirstCertExpires());
+    SSLContextPtr ssl_ctx = SSL_CTX_new(TLS_method());
+    ASSERT_OK(validator().addClientValidationContext(ssl_ctx.get(), true));
+    EXPECT_EQ(0, sk_X509_NAME_num(SSL_CTX_get_client_CA_list(ssl_ctx.get())));
+    EXPECT_EQ(
+        SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT,
+        validator().initializeSslContexts({ssl_ctx.get()}, false, *store().rootScope()).value());
+    for (bool is_server : {false, true}) {
+      auto cert = readCertFromFile(TestEnvironment::substitute(
+          "{{ test_rundir }}/test/common/tls/test_data/spiffe_san_cert.pem"));
+      bssl::UniquePtr<STACK_OF(X509)> chain(sk_X509_new_null());
+      sk_X509_push(chain.get(), cert.release());
+      EXPECT_EQ(ValidationResults::ValidationStatus::Failed,
+                validator()
+                    .doVerifyCertChain(*chain, nullptr, nullptr, *ssl_ctx, {}, is_server, "")
+                    .status);
+    }
+  }
+}
+
+TEST_F(TestSPIFFEValidator, TestUnsetBundleIsStillInvalid) {
+  EXPECT_THAT(initialize(R"EOF(
+name: envoy.tls.cert_validator.spiffe
+typed_config:
+  "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.SPIFFECertValidatorConfig
+  trust_domains:
+    - name: example.com
+      trust_bundle: {}
+)EOF"),
+              HasStatus(absl::StatusCode::kInvalidArgument,
+                        HasSubstr("Failed to load trusted CA certificate for example.com")));
+}
+
+TEST_F(TestSPIFFEValidator, TestEmptyStoreDoesNotUseAnotherDomainsRoots) {
+  ASSERT_OK(initialize(TestEnvironment::substitute(R"EOF(
+name: envoy.tls.cert_validator.spiffe
+typed_config:
+  "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.SPIFFECertValidatorConfig
+  trust_domains:
+    - name: example.com
+      trust_bundle:
+        inline_string: ""
+    - name: lyft.com
+      trust_bundle:
+        filename: "{{ test_rundir }}/test/common/tls/test_data/ca_cert.pem"
+)EOF")));
+  for (bool is_server : {false, true}) {
+    for (const auto* domain : {"example.com", "lyft.com", "unknown.com"}) {
+      auto cert = readCertFromFile(TestEnvironment::substitute(
+          "{{ test_rundir }}/test/common/tls/test_data/spiffe_san_cert.pem"));
+      replaceUriSans(cert.get(), {absl::StrCat("spiffe://", domain, "/workload")});
+      signWithTestCa(cert.get());
+      SSLContextPtr ssl_ctx = SSL_CTX_new(TLS_method());
+      bssl::UniquePtr<STACK_OF(X509)> chain(sk_X509_new_null());
+      sk_X509_push(chain.get(), cert.release());
+      EXPECT_EQ(std::string(domain) == "lyft.com" ? ValidationResults::ValidationStatus::Successful
+                                                  : ValidationResults::ValidationStatus::Failed,
+                validator()
+                    .doVerifyCertChain(*chain, nullptr, nullptr, *ssl_ctx, {}, is_server, "")
+                    .status);
+    }
+  }
 }
 
 TEST_F(TestSPIFFEValidator, TestInitializeSslContexts) {

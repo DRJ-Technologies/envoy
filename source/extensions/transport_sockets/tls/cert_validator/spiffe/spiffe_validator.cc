@@ -4,6 +4,7 @@
 #include <openssl/ssl.h>
 #include <openssl/x509v3.h>
 
+#include <algorithm>
 #include <cstdint>
 
 #include "envoy/common/exception.h"
@@ -37,6 +38,22 @@ namespace Tls {
 using SPIFFEConfig = envoy::extensions::transport_sockets::tls::v3::SPIFFECertValidatorConfig;
 
 namespace {
+const GENERAL_NAME* singleUriSan(const GENERAL_NAMES* names) {
+  if (names == nullptr) {
+    return nullptr;
+  }
+  const GENERAL_NAME* uri = nullptr;
+  for (const GENERAL_NAME* name : names) {
+    if (name->type == GEN_URI) {
+      if (uri != nullptr) {
+        return nullptr;
+      }
+      uri = name;
+    }
+  }
+  return uri;
+}
+
 absl::StatusOr<std::shared_ptr<SpiffeData>>
 parseTrustBundles(absl::string_view trust_bundle_mapping_str) {
   ENVOY_LOG_TO_LOGGER(Logger::Registry::getLog(Logger::Id::secret), info, "Parsing trust_bundles");
@@ -204,6 +221,14 @@ SPIFFEValidator::SPIFFEValidator(const Envoy::Ssl::CertificateValidationContextC
 
     auto cert = Config::DataSource::read(domain.trust_bundle(), true, config->api());
     SET_AND_RETURN_IF_NOT_OK(cert.status(), creation_status);
+    // An explicitly empty inline bundle revokes this domain's authority. Do not turn missing
+    // files, unset data sources or malformed nonempty PEM into a successfully loaded deny state.
+    if (cert->empty() &&
+        (domain.trust_bundle().has_inline_bytes() || domain.trust_bundle().has_inline_string())) {
+      spiffe_data_->trust_bundle_stores_[domain.name()][domain.workload_trust_domain()] =
+          X509StorePtr(X509_STORE_new());
+      continue;
+    }
     bssl::UniquePtr<BIO> bio(BIO_new_mem_buf(const_cast<char*>(cert->data()), cert->size()));
     RELEASE_ASSERT(bio != nullptr, "");
     bssl::UniquePtr<STACK_OF(X509_INFO)> list(
@@ -411,22 +436,11 @@ X509_STORE* SPIFFEValidator::getTrustBundleStore(X509* leaf_cert,
                                                  absl::string_view workload_trust_domain) {
   bssl::UniquePtr<GENERAL_NAMES> san_names(static_cast<GENERAL_NAMES*>(
       X509_get_ext_d2i(leaf_cert, NID_subject_alt_name, nullptr, nullptr)));
-  if (!san_names) {
+  const GENERAL_NAME* uri = singleUriSan(san_names.get());
+  if (uri == nullptr) {
     return nullptr;
   }
-
-  std::string trust_domain;
-  for (const GENERAL_NAME* general_name : san_names.get()) {
-    if (general_name->type != GEN_URI) {
-      continue;
-    }
-
-    const std::string san = Utility::generalNameAsString(general_name);
-    trust_domain = SPIFFEValidator::extractTrustDomain(san);
-    // We can assume that valid SVID has only one URI san.
-    break;
-  }
-
+  const std::string trust_domain = extractTrustDomain(Utility::generalNameAsString(uri));
   if (trust_domain.empty()) {
     return nullptr;
   }
@@ -452,23 +466,25 @@ bool SPIFFEValidator::certificatePrecheck(X509* leaf_cert) {
   }
 
   const auto us = X509_get_key_usage(leaf_cert);
-  return (us & (KU_CRL_SIGN | KU_KEY_CERT_SIGN)) == 0;
+  if ((us & (KU_CRL_SIGN | KU_KEY_CERT_SIGN)) != 0) {
+    return false;
+  }
+  bssl::UniquePtr<GENERAL_NAMES> names(static_cast<GENERAL_NAMES*>(
+      X509_get_ext_d2i(leaf_cert, NID_subject_alt_name, nullptr, nullptr)));
+  const GENERAL_NAME* uri = singleUriSan(names.get());
+  return uri != nullptr && !extractTrustDomain(Utility::generalNameAsString(uri)).empty();
 }
 
 bool SPIFFEValidator::matchSubjectAltName(X509& leaf_cert) {
   bssl::UniquePtr<GENERAL_NAMES> san_names(static_cast<GENERAL_NAMES*>(
       X509_get_ext_d2i(&leaf_cert, NID_subject_alt_name, nullptr, nullptr)));
-  // We must not have san_names == nullptr here because this function is called after the
-  // SPIFFE cert validation algorithm succeeded, which requires exactly one URI SAN in the leaf
-  // cert.
-  ASSERT(san_names != nullptr,
-         "san_names should have at least one name after SPIFFE cert validation");
-
-  for (const GENERAL_NAME* general_name : san_names.get()) {
-    for (const auto& config_san_matcher : subject_alt_name_matchers_) {
-      if (config_san_matcher->match(general_name)) {
-        return true;
-      }
+  const GENERAL_NAME* uri = singleUriSan(san_names.get());
+  if (uri == nullptr || extractTrustDomain(Utility::generalNameAsString(uri)).empty()) {
+    return false;
+  }
+  for (const auto& config_san_matcher : subject_alt_name_matchers_) {
+    if (config_san_matcher->match(uri)) {
+      return true;
     }
   }
   return false;
@@ -480,11 +496,35 @@ std::string SPIFFEValidator::extractTrustDomain(const std::string& san) {
     return "";
   }
 
-  auto pos = san.find('/', prefix.size());
-  if (pos != std::string::npos) {
-    return san.substr(prefix.size(), pos - prefix.size());
+  const auto pos = san.find('/', prefix.size());
+  if (pos == std::string::npos || pos == prefix.size() || pos + 1 == san.size()) {
+    return "";
   }
-  return "";
+  const auto domain = absl::string_view(san).substr(prefix.size(), pos - prefix.size());
+  if (domain.size() > 255) {
+    return "";
+  }
+  const auto valid_domain_char = [](char c) {
+    return (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '.' || c == '-' || c == '_';
+  };
+  if (!std::all_of(domain.begin(), domain.end(), valid_domain_char)) {
+    return "";
+  }
+  // SPIFFE path segments are nonempty, unescaped and cannot be relative path modifiers.
+  const auto path = absl::string_view(san).substr(pos + 1);
+  size_t start = 0;
+  for (size_t i = 0; i <= path.size(); ++i) {
+    if (i == path.size() || path[i] == '/') {
+      const auto segment = path.substr(start, i - start);
+      if (segment.empty() || segment == "." || segment == "..") {
+        return "";
+      }
+      start = i + 1;
+    } else if (!valid_domain_char(path[i]) && !(path[i] >= 'A' && path[i] <= 'Z')) {
+      return "";
+    }
+  }
+  return std::string(domain);
 }
 
 void SPIFFEValidator::initializeCertExpirationStats(Stats::Scope& scope,

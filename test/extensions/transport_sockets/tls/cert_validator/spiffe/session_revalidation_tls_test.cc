@@ -6,6 +6,7 @@
 
 #include "envoy/extensions/transport_sockets/tls/v3/tls.pb.h"
 #include "envoy/extensions/transport_sockets/tls/v3/tls_spiffe_validator_config.pb.h"
+#include "envoy/network/filter.h"
 #include "envoy/secret/secret_provider.h"
 
 #include "source/common/buffer/buffer_impl.h"
@@ -216,6 +217,18 @@ struct Endpoint : public Network::ConnectionCallbacks {
   std::function<void(Network::ConnectionEvent)> event_hook_;
 };
 
+// Native connections own their filters. In particular, the peer must consume a genuine
+// close_notify/end_stream through its filter chain while its write side remains open.
+class DrainingReadFilter : public Network::ReadFilter {
+public:
+  Network::FilterStatus onNewConnection() override { return Network::FilterStatus::Continue; }
+  Network::FilterStatus onData(Buffer::Instance& data, bool) override {
+    data.drain(data.length());
+    return Network::FilterStatus::Continue;
+  }
+  void initializeReadFilterCallbacks(Network::ReadFilterCallbacks&) override {}
+};
+
 struct Pair {
   explicit Pair(TimeSource& time_source)
       : stream_info_(time_source, nullptr, StreamInfo::FilterState::LifeSpan::Connection) {}
@@ -420,6 +433,7 @@ protected:
           prepared_socket ? std::move(prepared_socket)
                           : client_factory_->createTransportSocket(options, nullptr),
           nullptr, nullptr);
+      pair.client_->addReadFilter(std::make_shared<DrainingReadFilter>());
       pair.client_->addConnectionCallbacks(pair.client_events_);
       auto* ssl = rawSsl(*pair.client_);
       if (!GetParam() && gate != nullptr) {
@@ -441,6 +455,7 @@ protected:
         pending_socket_ ? std::move(pending_socket_)
                         : server_factory_->createDownstreamTransportSocket(),
         pair.stream_info_);
+    pair.server_->addReadFilter(std::make_shared<DrainingReadFilter>());
     pair.server_->addConnectionCallbacks(pair.server_events_);
     if (pending_gate_ != nullptr) {
       pending_gate_->install(rawSsl(*pair.server_));

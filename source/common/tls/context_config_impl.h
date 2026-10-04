@@ -78,6 +78,7 @@ public:
 
   void setSecretUpdateCallback(std::function<absl::Status()> callback) override;
   Ssl::HandshakerFactoryCb createHandshaker() const override;
+  bool usesDefaultHandshaker() const override { return uses_default_handshaker_; }
   Ssl::HandshakerCapabilities capabilities() const override { return capabilities_; }
   Ssl::SslCtxCb sslctxCb() const override { return sslctx_cb_; }
 
@@ -129,6 +130,7 @@ private:
 
   Ssl::HandshakerFactoryCb handshaker_factory_cb_;
   Ssl::HandshakerCapabilities capabilities_;
+  bool uses_default_handshaker_{false};
   Ssl::SslCtxCb sslctx_cb_;
   Server::Configuration::TransportSocketFactoryContext& factory_context_;
   const std::string tls_keylog_path_;

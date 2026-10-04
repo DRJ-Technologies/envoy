@@ -58,6 +58,8 @@ private:
   Envoy::Ssl::ServerContextConfigPtr config_;
   mutable absl::Mutex ssl_ctx_mu_;
   Envoy::Ssl::ServerContextSharedPtr ssl_ctx_ ABSL_GUARDED_BY(ssl_ctx_mu_);
+  std::shared_ptr<SessionRevalidation> session_revalidation_ ABSL_GUARDED_BY(ssl_ctx_mu_);
+  SessionRevalidation::PolicySharedPtr session_policy_ ABSL_GUARDED_BY(ssl_ctx_mu_);
 };
 
 } // namespace Tls

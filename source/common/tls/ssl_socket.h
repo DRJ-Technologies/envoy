@@ -52,7 +52,10 @@ public:
   create(Envoy::Ssl::ContextSharedPtr ctx, InitialState state,
          const Network::TransportSocketOptionsConstSharedPtr& transport_socket_options,
          Ssl::HandshakerFactoryCb handshaker_factory_cb,
-         Upstream::HostDescriptionConstSharedPtr host = {});
+         Upstream::HostDescriptionConstSharedPtr host = {},
+         std::shared_ptr<SessionRevalidation> tracker = {},
+         SessionRevalidation::PolicySharedPtr policy = {});
+  ~SslSocket() override;
 
   // Network::TransportSocket
   void setTransportSocketCallbacks(Network::TransportSocketCallbacks& callbacks) override;
@@ -100,6 +103,9 @@ private:
   void shutdownSsl();
   void shutdownBasic();
   void resumeHandshake();
+  bool validateCurrentSessionPolicy();
+  void onSessionPolicyUpdate();
+  void rejectSession();
 
   const Network::TransportSocketOptionsConstSharedPtr transport_socket_options_;
   Network::TransportSocketCallbacks* callbacks_{};
@@ -110,6 +116,11 @@ private:
   bool read_disabled_{false};
 
   SslHandshakerImplSharedPtr info_;
+  std::shared_ptr<SessionRevalidation> session_revalidation_;
+  SessionRevalidation::PolicySharedPtr session_policy_;
+  bool session_rejected_{false};
+  // Must be released before the members used by the worker callback.
+  SessionRevalidation::RegistrationPtr session_registration_;
 };
 
 class InvalidSslSocket : public Network::TransportSocket {

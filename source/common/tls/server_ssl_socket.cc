@@ -45,7 +45,15 @@ ServerSslSocketFactory::ServerSslSocketFactory(Envoy::Ssl::ServerContextConfigPt
   auto ctx_or_error = manager_.createSslServerContext(stats_scope_, *config_, nullptr);
   SET_AND_RETURN_IF_NOT_OK(ctx_or_error.status(), creation_status);
 
-  ssl_ctx_ = *ctx_or_error;
+  {
+    absl::WriterMutexLock lock(ssl_ctx_mu_);
+    ssl_ctx_ = *ctx_or_error;
+    if (const auto ctx = std::dynamic_pointer_cast<ContextImpl>(ssl_ctx_);
+        ctx != nullptr && ctx->supportsSessionRevalidation()) {
+      session_revalidation_ = ctx->sessionRevalidation();
+      session_policy_ = std::make_shared<SessionRevalidation::Policy>(ssl_ctx_);
+    }
+  }
   config_->setSecretUpdateCallback([this]() { return onAddOrUpdateSecret(); });
 }
 
@@ -56,13 +64,18 @@ Network::TransportSocketPtr ServerSslSocketFactory::createDownstreamTransportSoc
   // creating SslSocket using ssl_ctx. Capture ssl_ctx_ into a local variable so that we check and
   // use the same ssl_ctx to create SslSocket.
   Envoy::Ssl::ServerContextSharedPtr ssl_ctx;
+  std::shared_ptr<SessionRevalidation> tracker;
+  SessionRevalidation::PolicySharedPtr policy;
   {
     absl::ReaderMutexLock l(ssl_ctx_mu_);
     ssl_ctx = ssl_ctx_;
+    tracker = session_revalidation_;
+    policy = session_policy_;
   }
   if (ssl_ctx) {
-    auto status_or_socket = SslSocket::create(std::move(ssl_ctx), InitialState::Server, nullptr,
-                                              config_->createHandshaker());
+    auto status_or_socket =
+        SslSocket::create(std::move(ssl_ctx), InitialState::Server, nullptr,
+                          config_->createHandshaker(), {}, std::move(tracker), std::move(policy));
     if (status_or_socket.ok()) {
       return std::move(*status_or_socket);
     }
@@ -82,6 +95,18 @@ absl::Status ServerSslSocketFactory::onAddOrUpdateSecret() {
   RETURN_IF_NOT_OK(ctx_or_error.status());
   {
     absl::WriterMutexLock l(ssl_ctx_mu_);
+    if (session_policy_ != nullptr) {
+      // Publish first, while creation still observes the old SSL context. An old-context
+      // handshake must pass the new policy before Connected; no removal can be lost here.
+      if (!session_revalidation_->publish(session_policy_, *ctx_or_error)) {
+        manager_.removeContext(*ctx_or_error);
+        return absl::FailedPreconditionError("TLS session updates are shut down");
+      }
+    } else if (const auto ctx = std::dynamic_pointer_cast<ContextImpl>(*ctx_or_error);
+               ctx != nullptr && ctx->supportsSessionRevalidation()) {
+      session_revalidation_ = ctx->sessionRevalidation();
+      session_policy_ = std::make_shared<SessionRevalidation::Policy>(*ctx_or_error);
+    }
     std::swap(*ctx_or_error, ssl_ctx_);
   }
   manager_.removeContext(*ctx_or_error);

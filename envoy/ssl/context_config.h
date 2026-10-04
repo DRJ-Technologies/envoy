@@ -88,6 +88,9 @@ public:
    */
   virtual HandshakerFactoryCb createHandshaker() const PURE;
 
+  // Only the native handshaker participates in established typed-SPIFFE session revalidation.
+  virtual bool usesDefaultHandshaker() const { return false; }
+
   /**
    * @return the set of capabilities for handshaker instances created by this context.
    */

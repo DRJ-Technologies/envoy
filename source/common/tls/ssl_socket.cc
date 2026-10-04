@@ -30,12 +30,16 @@ constexpr absl::string_view NotReadyReason{"TLS error: Secret is not supplied by
 
 absl::string_view NotReadySslSocket::failureReason() const { return NotReadyReason; }
 
-absl::StatusOr<std::unique_ptr<SslSocket>>
-SslSocket::create(Envoy::Ssl::ContextSharedPtr ctx, InitialState state,
-                  const Network::TransportSocketOptionsConstSharedPtr& transport_socket_options,
-                  Ssl::HandshakerFactoryCb handshaker_factory_cb,
-                  Upstream::HostDescriptionConstSharedPtr host) {
+absl::StatusOr<std::unique_ptr<SslSocket>> SslSocket::create(
+    Envoy::Ssl::ContextSharedPtr ctx, InitialState state,
+    const Network::TransportSocketOptionsConstSharedPtr& transport_socket_options,
+    Ssl::HandshakerFactoryCb handshaker_factory_cb, Upstream::HostDescriptionConstSharedPtr host,
+    std::shared_ptr<SessionRevalidation> tracker, SessionRevalidation::PolicySharedPtr policy) {
   std::unique_ptr<SslSocket> socket(new SslSocket(ctx, transport_socket_options));
+  if (socket->ctx_->supportsSessionRevalidation()) {
+    socket->session_revalidation_ = std::move(tracker);
+    socket->session_policy_ = std::move(policy);
+  }
   auto status = socket->initialize(state, handshaker_factory_cb, host);
   if (status.ok()) {
     return socket;
@@ -48,6 +52,8 @@ SslSocket::SslSocket(Envoy::Ssl::ContextSharedPtr ctx,
                      const Network::TransportSocketOptionsConstSharedPtr& transport_socket_options)
     : transport_socket_options_(transport_socket_options),
       ctx_(std::dynamic_pointer_cast<ContextImpl>(ctx)) {}
+
+SslSocket::~SslSocket() { session_registration_.reset(); }
 
 absl::Status SslSocket::initialize(InitialState state,
                                    Ssl::HandshakerFactoryCb handshaker_factory_cb,
@@ -84,6 +90,16 @@ void SslSocket::setTransportSocketCallbacks(Network::TransportSocketCallbacks& c
   BIO* bio = BIO_new_io_handle(&callbacks_->ioHandle());
   SSL_set_bio(rawSsl(), bio, bio);
   SSL_set_ex_data(rawSsl(), ContextImpl::sslSocketIndex(), static_cast<void*>(callbacks_));
+  if (session_revalidation_ != nullptr) {
+    // Register before any handshake I/O. Updates during an incomplete handshake are enforced by
+    // the current-policy check before Connected, even if their worker notification came first.
+    session_registration_ = session_revalidation_->registerSession(
+        session_policy_, [this] { onSessionPolicyUpdate(); });
+    if (session_registration_ == nullptr) {
+      session_rejected_ = true;
+      failure_reason_ = "typed SPIFFE session has no owning worker registration";
+    }
+  }
 }
 
 SslSocket::ReadResult SslSocket::sslReadIntoSlice(Buffer::RawSlice& slice) {
@@ -108,6 +124,9 @@ SslSocket::ReadResult SslSocket::sslReadIntoSlice(Buffer::RawSlice& slice) {
 }
 
 Network::IoResult SslSocket::doRead(Buffer::Instance& read_buffer) {
+  if (session_rejected_) {
+    return {PostIoAction::Close, 0, false};
+  }
   if (info_->state() != Ssl::SocketState::HandshakeComplete &&
       info_->state() != Ssl::SocketState::ShutdownSent) {
     PostIoAction action = doHandshake();
@@ -191,6 +210,10 @@ void SslSocket::resumeHandshake() {
 Network::Connection& SslSocket::connection() const { return callbacks_->connection(); }
 
 void SslSocket::onSuccess(SSL* ssl) {
+  if (session_registration_ != nullptr && !validateCurrentSessionPolicy()) {
+    rejectSession();
+    return;
+  }
   ctx_->logHandshake(ssl);
   if (callbacks_->connection().streamInfo().upstreamInfo()) {
     callbacks_->connection()
@@ -214,9 +237,54 @@ void SslSocket::onSuccess(SSL* ssl) {
   callbacks_->raiseEvent(Network::ConnectionEvent::Connected);
 }
 
+bool SslSocket::validateCurrentSessionPolicy() {
+  ValidationResults result{ValidationResults::ValidationStatus::Failed,
+                           Ssl::ClientValidationStatus::Failed, std::nullopt, std::nullopt};
+  const bool accepted = session_registration_->withCurrentPolicy([&](const auto& current) {
+    const auto context = std::dynamic_pointer_cast<ContextImpl>(current.context_);
+    if (context == nullptr ||
+        !ctx_->matchesSessionPeerIdentity(rawSsl(), transport_socket_options_)) {
+      return false;
+    }
+    result = context->revalidatePeer(rawSsl(), transport_socket_options_, callbacks_);
+    return result.status == ValidationResults::ValidationStatus::Successful &&
+           result.detailed_status == Ssl::ClientValidationStatus::Validated;
+  });
+  // No connection event or close occurs while the policy reader lock is held.
+  auto* extended = static_cast<Ssl::SslExtendedSocketInfo*>(
+      SSL_get_ex_data(rawSsl(), ContextImpl::sslExtendedSocketInfoIndex()));
+  extended->setCertificateValidationStatus(accepted ? Ssl::ClientValidationStatus::Validated
+                                                    : Ssl::ClientValidationStatus::Failed);
+  extended->setValidatedCertChain(std::move(result.validated_chain));
+  if (!accepted) {
+    failure_reason_ = absl::StrCat("typed SPIFFE session policy rejected peer: ",
+                                   result.error_details.value_or("identity or policy unavailable"));
+  }
+  return accepted;
+}
+
+void SslSocket::onSessionPolicyUpdate() {
+  // A write-half-closed TLS socket still receives peer data until its read side closes.
+  if ((info_->state() == Ssl::SocketState::HandshakeComplete ||
+       info_->state() == Ssl::SocketState::ShutdownSent) &&
+      !validateCurrentSessionPolicy()) {
+    rejectSession();
+  }
+}
+
+void SslSocket::rejectSession() {
+  session_rejected_ = true;
+  session_registration_.reset();
+  // Closing can reentrantly tear down this socket. It is the final operation in this callback.
+  callbacks_->connection().close(Network::ConnectionCloseType::NoFlush, "spiffe_session_policy");
+}
+
 void SslSocket::onFailure() { drainErrorQueue(); }
 
 PostIoAction SslSocket::doHandshake() {
+  if (session_rejected_) {
+    return PostIoAction::Close;
+  }
   auto ret = info_->doHandshake();
   if (ret == PostIoAction::KeepOpen) {
     if (info_->state() == Ssl::SocketState::HandshakeBlockedOnAsyncOperation && !read_disabled_) {
@@ -328,6 +396,9 @@ void SslSocket::drainErrorQueue() {
 }
 
 Network::IoResult SslSocket::doWrite(Buffer::Instance& write_buffer, bool end_stream) {
+  if (session_rejected_) {
+    return {PostIoAction::Close, 0, false};
+  }
   ASSERT(info_->state() != Ssl::SocketState::ShutdownSent || write_buffer.length() == 0);
   if (info_->state() != Ssl::SocketState::HandshakeComplete &&
       info_->state() != Ssl::SocketState::ShutdownSent) {
@@ -425,6 +496,7 @@ void SslSocket::shutdownBasic() {
 }
 
 void SslSocket::closeSocket(Network::ConnectionEvent, bool abort_reset) {
+  session_registration_.reset();
   // Unregister the SSL connection object from private key method providers.
   for (auto const& provider : ctx_->getPrivateKeyMethodProviders()) {
     provider->unregisterPrivateKeyMethod(rawSsl());

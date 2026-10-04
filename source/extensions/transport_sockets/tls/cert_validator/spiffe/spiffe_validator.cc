@@ -334,7 +334,7 @@ absl::StatusOr<int> SPIFFEValidator::initializeSslContexts(std::vector<SSL_CTX*>
 }
 
 bool SPIFFEValidator::verifyCertChainUsingTrustBundleStore(
-    X509& leaf_cert, STACK_OF(X509)* cert_chain, X509_VERIFY_PARAM* verify_param,
+    X509& leaf_cert, STACK_OF(X509)* cert_chain, X509_VERIFY_PARAM* verify_param, bool is_server,
     absl::string_view workload_trust_domain, std::string& error_details,
     std::vector<bssl::UniquePtr<X509>>& validated_chain) {
   if (!SPIFFEValidator::certificatePrecheck(&leaf_cert)) {
@@ -360,6 +360,13 @@ bool SPIFFEValidator::verifyCertChainUsingTrustBundleStore(
   }
   if (allow_expired_certificate_) {
     X509_STORE_CTX_set_flags(new_store_ctx.get(), X509_V_FLAG_NO_CHECK_TIME);
+  }
+  if (supportsSessionRevalidation() &&
+      !X509_STORE_CTX_set_purpose(new_store_ctx.get(),
+                                  is_server ? X509_PURPOSE_SSL_CLIENT : X509_PURPOSE_SSL_SERVER)) {
+    error_details = "verify cert failed: TLS peer certificate purpose";
+    stats_.fail_verify_error_.inc();
+    return false;
   }
   auto ret = X509_verify_cert(new_store_ctx.get());
   if (!ret) {
@@ -421,15 +428,45 @@ ValidationResults SPIFFEValidator::doVerifyCertChain(
   absl::string_view workload_trust_domain = obj ? obj->asString() : "";
   std::string error_details;
   std::vector<bssl::UniquePtr<X509>> validated_chain;
-  bool verified =
-      verifyCertChainUsingTrustBundleStore(*leaf_cert, &cert_chain, SSL_CTX_get0_param(&ssl_ctx),
-                                           workload_trust_domain, error_details, validated_chain);
+  bool verified = verifyCertChainUsingTrustBundleStore(
+      *leaf_cert, &cert_chain, SSL_CTX_get0_param(&ssl_ctx), is_server, workload_trust_domain,
+      error_details, validated_chain);
+  if (verified && supportsSessionRevalidation() &&
+      !matchesSessionPeerIdentity(*leaf_cert, transport_socket_options)) {
+    verified = false;
+    error_details = "verify cert failed: SPIFFE endpoint identity";
+    stats_.fail_verify_san_.inc();
+  }
   return verified ? ValidationResults{ValidationResults::ValidationStatus::Successful,
                                       Envoy::Ssl::ClientValidationStatus::Validated, std::nullopt,
                                       std::nullopt, std::move(validated_chain)}
                   : ValidationResults{ValidationResults::ValidationStatus::Failed,
                                       Envoy::Ssl::ClientValidationStatus::Failed, std::nullopt,
                                       error_details};
+}
+
+bool SPIFFEValidator::matchesSessionPeerIdentity(
+    X509& leaf, const Network::TransportSocketOptionsConstSharedPtr& options) {
+  if (!certificatePrecheck(&leaf) ||
+      (!subject_alt_name_matchers_.empty() && !matchSubjectAltName(leaf))) {
+    return false;
+  }
+  if (options == nullptr || options->verifySubjectAltNameListOverride().empty()) {
+    return true;
+  }
+  bssl::UniquePtr<GENERAL_NAMES> names(
+      static_cast<GENERAL_NAMES*>(X509_get_ext_d2i(&leaf, NID_subject_alt_name, nullptr, nullptr)));
+  const GENERAL_NAME* uri = singleUriSan(names.get());
+  if (uri == nullptr) {
+    return false;
+  }
+  const auto identity = Utility::generalNameAsString(uri);
+  for (const auto& expected : options->verifySubjectAltNameListOverride()) {
+    if (expected == identity) {
+      return true;
+    }
+  }
+  return false;
 }
 
 X509_STORE* SPIFFEValidator::getTrustBundleStore(X509* leaf_cert,

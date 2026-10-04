@@ -11,6 +11,25 @@ licenses(["notice"])  # Apache 2
 
 envoy_package()
 
+envoy_cc_test(
+    name = "session_revalidation_test",
+    srcs = ["session_revalidation_test.cc"],
+    deps = [
+        "//source/common/api:api_lib",
+        "//source/common/common:thread_lib",
+        "//source/common/event:dispatcher_lib",
+        "//source/common/thread_local:thread_local_lib",
+        "//source/common/tls:session_revalidation_lib",
+        "//test/mocks/network:network_mocks",
+        "//test/mocks/ssl:ssl_mocks",
+        "//test/test_common:simulated_time_system_lib",
+        "//test/test_common:thread_factory_for_test_lib",
+        "//test/test_common:utility_lib",
+        "@abseil-cpp//absl/synchronization",
+    ],
+)
+
+
 envoy_cc_test_library(
     name = "ssl_certs_test_lib",
     hdrs = ["ssl_certs_test.h"],

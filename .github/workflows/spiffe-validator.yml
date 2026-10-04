@@ -8,6 +8,10 @@ on:
     paths:
     - .github/workflows/spiffe-validator.yml
     - .bazelversion
+    - envoy/ssl/context_config.h
+    - source/common/tls/**
+    - test/common/tls/BUILD
+    - test/common/tls/session_revalidation*.cc
     - source/extensions/transport_sockets/tls/cert_validator/spiffe/**
     - test/extensions/transport_sockets/tls/cert_validator/spiffe/**
     - docs/root/api-v3/config/certificate_validators/**
@@ -41,11 +45,13 @@ jobs:
         chmod +x "$name"
         ln -s "$RUNNER_TEMP/$name" "$RUNNER_TEMP/bazel"
         echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
-    - name: Native SPIFFE validator regression tests
+    - name: Native SPIFFE validator and session regression tests
       shell: bash
       run: |
         bazel --batch --output_user_root="$RUNNER_TEMP/bazel-root" \
           --host_jvm_args=-Xmx2g test --config=gcc --jobs=4 \
           --local_resources=cpu=4 --local_resources=memory=6144 \
           --compilation_mode=fastbuild --copt=-g0 --test_output=errors \
-          //test/extensions/transport_sockets/tls/cert_validator/spiffe:spiffe_validator_test
+          //test/extensions/transport_sockets/tls/cert_validator/spiffe:spiffe_validator_test \
+          //test/common/tls:session_revalidation_test \
+          //test/extensions/transport_sockets/tls/cert_validator/spiffe:session_revalidation_tls_test

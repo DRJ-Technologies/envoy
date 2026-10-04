@@ -18,6 +18,45 @@ filegroup(
 envoy_package()
 
 envoy_extension_cc_test(
+    name = "session_revalidation_tls_test",
+    srcs = ["session_revalidation_tls_test.cc"],
+    data = ["//test/common/tls/test_data:certs"],
+    extension_names = ["envoy.tls.cert_validator.spiffe"],
+    external_deps = ["ssl"],
+    deps = [
+        "//envoy/secret:secret_provider_interface",
+        "//source/common/api:api_lib",
+        "//source/common/buffer:buffer_lib",
+        "//source/common/common:callback_impl_lib",
+        "//source/common/event:dispatcher_lib",
+        "//source/common/network:listen_socket_lib",
+        "//source/common/network:listener_lib",
+        "//source/common/network:transport_socket_options_lib",
+        "//source/common/singleton:manager_impl_lib",
+        "//source/common/stream_info:stream_info_lib",
+        "//source/common/thread_local:thread_local_lib",
+        "//source/common/tls:context_config_lib",
+        "//source/common/tls:context_lib",
+        "//source/common/tls:server_context_config_lib",
+        "//source/common/tls:ssl_handshaker_lib",
+        "//source/common/tls:ssl_socket_lib",
+        "//source/extensions/transport_sockets/tls/cert_validator/spiffe:config",
+        "//test/mocks/runtime:runtime_mocks",
+        "//test/mocks/secret:secret_mocks",
+        "//test/mocks/server:server_factory_context_mocks",
+        "//test/test_common:environment_lib",
+        "//test/test_common:network_utility_lib",
+        "//test/test_common:registry_lib",
+        "//test/test_common:simulated_time_system_lib",
+        "//test/test_common:thread_factory_for_test_lib",
+        "//test/test_common:utility_lib",
+        "@abseil-cpp//absl/strings",
+        "@abseil-cpp//absl/synchronization",
+        "@envoy_api//envoy/extensions/transport_sockets/tls/v3:pkg_cc_proto",
+    ],
+)
+
+envoy_extension_cc_test(
     name = "spiffe_validator_test",
     srcs = [
         "spiffe_validator_test.cc",

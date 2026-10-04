@@ -260,6 +260,17 @@ struct ApplicationWrites {
   }
 };
 
+struct ShutdownNotification {
+  absl::Notification sent_;
+  static void callback(int write, int, int type, const void* data, size_t length, SSL*, void* arg) {
+    auto& sent = static_cast<ShutdownNotification*>(arg)->sent_;
+    if (write != 0 && type == SSL3_RT_ALERT && length == 2 &&
+        static_cast<const uint8_t*>(data)[1] == SSL_AD_CLOSE_NOTIFY && !sent.HasBeenNotified()) {
+      sent.Notify();
+    }
+  }
+};
+
 // The parameter selects which real TLS role consumes updates: true = downstream server verifies
 // the client, false = upstream client verifies the server. Both ends always use real TLS/mTLS.
 class SessionRevalidationTlsTest : public testing::TestWithParam<bool>,
@@ -449,6 +460,28 @@ protected:
   Network::Connection& selectedConnection(Pair& pair) {
     return GetParam() ? *pair.server_ : *pair.client_;
   }
+  void halfClose(Pair& pair) {
+    ShutdownNotification shutdown;
+    onWorker([&] {
+      pair.client_->enableHalfClose(true);
+      pair.server_->enableHalfClose(true);
+      auto& connection = selectedConnection(pair);
+      SSL_set_msg_callback(rawSsl(connection), ShutdownNotification::callback);
+      SSL_set_msg_callback_arg(rawSsl(connection), &shutdown);
+      Buffer::OwnedImpl empty;
+      connection.write(empty, true);
+    });
+    shutdown.sent_.WaitForNotification();
+    onWorker([&] {
+      auto& connection = selectedConnection(pair);
+      EXPECT_NE(0, SSL_get_shutdown(rawSsl(connection)) & SSL_SENT_SHUTDOWN);
+      EXPECT_EQ(Ssl::SocketState::ShutdownSent,
+                dynamic_cast<const SslHandshakerImpl*>(connection.ssl().get())->state());
+      EXPECT_EQ(Network::Connection::State::Open, connection.state());
+      SSL_set_msg_callback(rawSsl(connection), nullptr);
+      SSL_set_msg_callback_arg(rawSsl(connection), nullptr);
+    });
+  }
   void waitReady(Pair& pair) {
     pair.client_events_.ready_.WaitForNotification();
     pair.server_events_.ready_.WaitForNotification();
@@ -549,6 +582,31 @@ TEST_P(SessionRevalidationTlsTest, DomainRemovalClosesEstablishedSession) {
   expectConnected(pair);
   update(mapped("", ""));
   expectClosed(pair);
+}
+
+TEST_P(SessionRevalidationTlsTest, DomainRemovalClosesWriteHalfClosedSession) {
+  setup();
+  auto& pair = connect();
+  expectConnected(pair);
+  halfClose(pair);
+  update(mapped("", ""));
+  expectClosed(pair);
+}
+
+TEST_P(SessionRevalidationTlsTest, CurrentStorePreservesValidWriteHalfClosedSession) {
+  setup();
+  auto& pair = connect();
+  expectConnected(pair);
+  halfClose(pair);
+  update(mapped(fixture("ca_cert.pem")));
+  onWorker([&] {
+    auto& connection = selectedConnection(pair);
+    EXPECT_EQ(Network::Connection::State::Open, connection.state());
+    EXPECT_EQ(Ssl::SocketState::ShutdownSent,
+              dynamic_cast<const SslHandshakerImpl*>(connection.ssl().get())->state());
+    EXPECT_EQ(0, selectedEvents(pair).closed_);
+    EXPECT_TRUE(connection.ssl()->peerCertificateValidated());
+  });
 }
 
 TEST_P(SessionRevalidationTlsTest, RejectedSessionCannotWritePendingDataDuringNoFlushClose) {

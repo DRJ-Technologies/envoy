@@ -264,7 +264,10 @@ bool SslSocket::validateCurrentSessionPolicy() {
 }
 
 void SslSocket::onSessionPolicyUpdate() {
-  if (info_->state() == Ssl::SocketState::HandshakeComplete && !validateCurrentSessionPolicy()) {
+  // A write-half-closed TLS socket still receives peer data until its read side closes.
+  if ((info_->state() == Ssl::SocketState::HandshakeComplete ||
+       info_->state() == Ssl::SocketState::ShutdownSent) &&
+      !validateCurrentSessionPolicy()) {
     rejectSession();
   }
 }

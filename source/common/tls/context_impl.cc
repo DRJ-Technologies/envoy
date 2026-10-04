@@ -13,6 +13,7 @@
 #include "envoy/admin/v3/certs.pb.h"
 #include "envoy/common/exception.h"
 #include "envoy/common/platform.h"
+#include "envoy/singleton/manager.h"
 #include "envoy/ssl/ssl_socket_extended_info.h"
 #include "envoy/stats/scope.h"
 #include "envoy/type/matcher/v3/string.pb.h"
@@ -60,6 +61,8 @@ namespace Extensions {
 namespace TransportSockets {
 namespace Tls {
 
+SINGLETON_MANAGER_REGISTRATION(tls_session_revalidation);
+
 int ContextImpl::sslExtendedSocketInfoIndex() {
   CONSTRUCT_ON_FIRST_USE(int, []() -> int {
     int ssl_context_index = SSL_get_ex_new_index(0, nullptr, nullptr, nullptr, nullptr);
@@ -84,6 +87,7 @@ ContextImpl::ContextImpl(
       ssl_versions_(stat_name_set_->add("ssl.versions")),
       ssl_curves_(stat_name_set_->add("ssl.curves")),
       ssl_sigalgs_(stat_name_set_->add("ssl.sigalgs")), capabilities_(config.capabilities()),
+      uses_default_handshaker_(config.usesDefaultHandshaker()),
       tls_keylog_local_(config.tlsKeyLogLocal()), tls_keylog_remote_(config.tlsKeyLogRemote()) {
 
   auto cert_validator_name = getCertValidatorName(config.certificateValidationContext());
@@ -560,6 +564,38 @@ ValidationResults ContextImpl::customVerifyCertChain(
         result.status == ValidationResults::ValidationStatus::Successful, false);
   }
   return result;
+}
+
+std::shared_ptr<SessionRevalidation> ContextImpl::sessionRevalidation() {
+  ASSERT(supportsSessionRevalidation());
+  return factory_context_.singletonManager().getTyped<SessionRevalidation>(
+      SINGLETON_MANAGER_REGISTERED_NAME(tls_session_revalidation),
+      [this] { return std::make_shared<SessionRevalidation>(factory_context_.threadLocal()); },
+      true);
+}
+
+bool ContextImpl::matchesSessionPeerIdentity(
+    SSL* ssl, const Network::TransportSocketOptionsConstSharedPtr& options) {
+  const auto* chain = SSL_get_peer_full_cert_chain(ssl);
+  return supportsSessionRevalidation() && chain != nullptr && sk_X509_num(chain) != 0 &&
+         cert_validator_->matchesSessionPeerIdentity(*sk_X509_value(chain, 0), options);
+}
+
+ValidationResults
+ContextImpl::revalidatePeer(SSL* ssl, const Network::TransportSocketOptionsConstSharedPtr& options,
+                            Network::TransportSocketCallbacks* callbacks) {
+  auto* chain = SSL_get_peer_full_cert_chain(ssl);
+  if (!supportsSessionRevalidation() || chain == nullptr || sk_X509_num(chain) == 0 ||
+      SSL_session_reused(ssl)) {
+    return {ValidationResults::ValidationStatus::Failed, Ssl::ClientValidationStatus::Failed,
+            SSL_AD_CERTIFICATE_UNKNOWN,
+            "typed SPIFFE session has no current full-handshake authority"};
+  }
+  // Use the original wire chain, not the old validator's constructed chain/trust anchor. Every
+  // SSL_CTX in this replacement context shares its current verification parameters.
+  return cert_validator_->doVerifyCertChain(
+      *chain, nullptr, options, *tls_contexts_[0].ssl_ctx_, {callbacks}, SSL_is_server(ssl),
+      absl::NullSafeStringView(SSL_get_servername(ssl, TLSEXT_NAMETYPE_host_name)));
 }
 
 void ContextImpl::incCounter(const Stats::StatName name, absl::string_view value,

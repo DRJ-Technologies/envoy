@@ -57,6 +57,14 @@ public:
 
   virtual ~CertValidator() = default;
 
+  // Opt-in is restricted to synchronous typed SPIFFE stores. Other validators retain their
+  // existing handshake/update behavior, including asynchronous and external validators.
+  virtual bool supportsSessionRevalidation() const { return false; }
+  virtual bool matchesSessionPeerIdentity(X509&,
+                                          const Network::TransportSocketOptionsConstSharedPtr&) {
+    return false;
+  }
+
   /**
    * Called to add the client validation context information to a given ssl context
    *

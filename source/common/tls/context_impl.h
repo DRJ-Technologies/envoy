@@ -21,6 +21,7 @@
 #include "source/common/stats/symbol_table.h"
 #include "source/common/tls/cert_validator/cert_validator.h"
 #include "source/common/tls/context_manager_impl.h"
+#include "source/common/tls/session_revalidation.h"
 #include "source/common/tls/stats.h"
 
 #include "absl/synchronization/mutex.h"
@@ -93,6 +94,15 @@ public:
   void logHandshake(SSL* ssl) const;
 
   SslStats& stats() { return stats_; }
+  bool supportsSessionRevalidation() const {
+    return uses_default_handshaker_ && cert_validator_->supportsSessionRevalidation();
+  }
+  std::shared_ptr<SessionRevalidation> sessionRevalidation();
+  bool matchesSessionPeerIdentity(SSL* ssl,
+                                  const Network::TransportSocketOptionsConstSharedPtr& options);
+  ValidationResults revalidatePeer(SSL* ssl,
+                                   const Network::TransportSocketOptionsConstSharedPtr& options,
+                                   Network::TransportSocketCallbacks* callbacks);
 
   /**
    * The global SSL-library index used for storing a pointer to the SslExtendedSocketInfo
@@ -182,6 +192,7 @@ protected:
   const Stats::StatName ssl_curves_;
   const Stats::StatName ssl_sigalgs_;
   const Ssl::HandshakerCapabilities capabilities_;
+  const bool uses_default_handshaker_;
   const Network::Address::IpList tls_keylog_local_;
   const Network::Address::IpList tls_keylog_remote_;
   AccessLog::AccessLogFileSharedPtr tls_keylog_file_;

@@ -45,12 +45,18 @@ class SPIFFEValidator : public CertValidator, Logger::Loggable<Logger::Id::secre
 public:
   SPIFFEValidator(SslStats& stats, Server::Configuration::CommonFactoryContext& context)
       : spiffe_data_(std::make_shared<SpiffeData>()), stats_(stats),
-        time_source_(context.timeSource()) {};
+        time_source_(context.timeSource()){};
   SPIFFEValidator(const Envoy::Ssl::CertificateValidationContextConfig* config, SslStats& stats,
                   Server::Configuration::CommonFactoryContext& context, Stats::Scope& scope,
                   absl::Status& creation_status);
 
   ~SPIFFEValidator() override = default;
+  bool supportsSessionRevalidation() const override {
+    return spiffe_data_ != nullptr && !bundle_provider_;
+  }
+  bool
+  matchesSessionPeerIdentity(X509& leaf,
+                             const Network::TransportSocketOptionsConstSharedPtr& options) override;
 
   // Tls::CertValidator
   absl::Status addClientValidationContext(SSL_CTX* context, bool require_client_cert) override;
@@ -86,7 +92,7 @@ public:
 
 private:
   bool verifyCertChainUsingTrustBundleStore(X509& leaf_cert, STACK_OF(X509)* cert_chain,
-                                            X509_VERIFY_PARAM* verify_param,
+                                            X509_VERIFY_PARAM* verify_param, bool is_server,
                                             absl::string_view workload_trust_domain,
                                             std::string& error_details,
                                             std::vector<bssl::UniquePtr<X509>>& validated_chain);

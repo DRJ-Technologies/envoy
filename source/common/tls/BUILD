@@ -11,6 +11,19 @@ licenses(["notice"])  # Apache 2
 envoy_package()
 
 envoy_cc_library(
+    name = "session_revalidation_lib",
+    srcs = ["session_revalidation.cc"],
+    hdrs = ["session_revalidation.h"],
+    deps = [
+        "//envoy/singleton:instance_interface",
+        "//envoy/ssl:context_interface",
+        "//envoy/thread_local:thread_local_interface",
+        "//source/common/common:thread_lib",
+        "@abseil-cpp//absl/synchronization",
+    ],
+)
+
+envoy_cc_library(
     name = "connection_info_impl_base_lib",
     srcs = ["connection_info_impl_base.cc"],
     hdrs = ["connection_info_impl_base.h"],
@@ -183,8 +196,10 @@ envoy_cc_library(
     visibility = ["//visibility:public"],
     deps = [
         ":cert_compression_lib",
+        ":session_revalidation_lib",
         ":stats_lib",
         ":utility_lib",
+        "//envoy/singleton:manager_interface",
         "//envoy/ssl:context_config_interface",
         "//envoy/ssl:context_interface",
         "//envoy/ssl:context_manager_interface",

@@ -293,6 +293,7 @@ ContextConfigImpl::ContextConfigImpl(
         factory_context.messageValidationVisitor());
   } else {
     // Otherwise, derive the config from the default factory.
+    uses_default_handshaker_ = true;
     handshaker_factory = HandshakerFactoryImpl::getDefaultHandshakerFactory();
     handshaker_factory_cb_ = handshaker_factory->createHandshakerCb(
         *handshaker_factory->createEmptyConfigProto(), handshaker_factory_context,
